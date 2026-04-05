@@ -1,0 +1,49 @@
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+  border: 1px solid transparent;
+  text-transform: uppercase;
+}
+
+.status-badge--pending {
+  background: var(--pending-bg);
+  color: var(--pending);
+  border-color: rgba(139, 92, 246, 0.2);
+}
+
+.status-badge--running {
+  background: var(--running-bg);
+  color: var(--running);
+  border-color: rgba(6, 182, 212, 0.2);
+}
+
+.status-badge--success {
+  background: var(--success-bg);
+  color: var(--success);
+  border-color: rgba(34, 197, 94, 0.2);
+}
+
+.status-badge--failed {
+  background: var(--error-bg);
+  color: var(--error);
+  border-color: rgba(239, 68, 68, 0.2);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.status-dot--pulse {
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}

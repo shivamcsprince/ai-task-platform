@@ -1,0 +1,136 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: ai-task-platform
+  labels:
+    app: worker
+spec:
+  replicas: 2   # HPA will manage this dynamically
+  selector:
+    matchLabels:
+      app: worker
+  # Recreate is fine for workers — they are stateless and jobs are in Redis
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 2
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      initContainers:
+        - name: wait-for-mongodb
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z mongodb-service 27017; do echo waiting for mongodb; sleep 2; done']
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis-service 6379; do echo waiting for redis; sleep 2; done']
+      containers:
+        - name: worker
+          image: yourdockerhubuser/ai-task-worker:latest  # Updated by CI/CD
+          imagePullPolicy: Always
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: MONGODB_URI
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: REDIS_PORT
+            - name: REDIS_QUEUE_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: REDIS_QUEUE_NAME
+            - name: WORKER_POLL_TIMEOUT
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: WORKER_POLL_TIMEOUT
+            - name: WORKER_MAX_RETRIES
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: WORKER_MAX_RETRIES
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: REDIS_PASSWORD
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: LOG_LEVEL
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          # Workers have no HTTP endpoint; use a process-check liveness probe
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - |
+                  import redis, os
+                  r = redis.Redis(
+                    host=os.getenv('REDIS_HOST','localhost'),
+                    port=int(os.getenv('REDIS_PORT',6379)),
+                    password=os.getenv('REDIS_PASSWORD'),
+                    socket_connect_timeout=3
+                  )
+                  r.ping()
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+# HPA — scale workers based on CPU usage
+# For production, consider KEDA for queue-depth-based scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: ai-task-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 120

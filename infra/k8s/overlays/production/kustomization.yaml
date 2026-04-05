@@ -1,0 +1,51 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Extend the base manifests
+bases:
+  - ../../base
+
+namespace: ai-task-platform
+
+# Production-specific image tags
+# These are updated automatically by the CI/CD pipeline
+images:
+  - name: yourdockerhubuser/ai-task-backend
+    newTag: "latest"   # CI replaces this with the actual git SHA tag
+  - name: yourdockerhubuser/ai-task-frontend
+    newTag: "latest"
+  - name: yourdockerhubuser/ai-task-worker
+    newTag: "latest"
+
+# Production-specific patches
+patches:
+  # Scale up backend and frontend for production
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+    target:
+      kind: Deployment
+      name: backend
+  - patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+    target:
+      kind: Deployment
+      name: frontend
+  # Scale worker HPA higher in production
+  - patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 20
+    target:
+      kind: HorizontalPodAutoscaler
+      name: worker-hpa
+
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - NODE_ENV=production
+      - LOG_LEVEL=warn

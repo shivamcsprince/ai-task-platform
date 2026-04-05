@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-task-platform
+  namespace: argocd
+  # Finalizer ensures Argo CD cleans up resources on deletion
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  # Source — the infra repository containing Kubernetes manifests
+  source:
+    # REPLACE with your actual infra repo URL
+    repoURL: https://github.com/yourusername/ai-task-platform-infra
+    targetRevision: main
+    path: k8s/overlays/production   # Use production overlay
+
+  # Destination — the cluster and namespace to deploy to
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: ai-task-platform
+
+  # Sync policy — fully automated GitOps
+  syncPolicy:
+    automated:
+      prune: true      # Delete resources removed from Git
+      selfHeal: true   # Re-sync if cluster state drifts from Git
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # Health check thresholds
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # Ignore HPA-managed replica counts

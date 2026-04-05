@@ -1,0 +1,234 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: docker.io
+  BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-frontend
+  WORKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/ai-task-worker
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1: Lint & Test Backend
+  # ─────────────────────────────────────────────────────────────────────────
+  test-backend:
+    name: 🧪 Test Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      mongodb:
+        image: mongo:7.0
+        ports: ["27017:27017"]
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linting
+        run: npm run lint || true  # Non-blocking in early stages
+
+      - name: Run tests
+        env:
+          NODE_ENV: test
+          MONGODB_URI: mongodb://localhost:27017/aitasks_test
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          JWT_SECRET: test-secret-for-ci-only
+          REDIS_QUEUE_NAME: test_queue
+        run: npm test
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2: Test Worker
+  # ─────────────────────────────────────────────────────────────────────────
+  test-worker:
+    name: 🐍 Test Worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: worker/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v --cov=. --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: worker/coverage.xml
+          flags: worker
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3: Build & Push Docker Images (only on push to main/staging)
+  # ─────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-worker]
+    if: github.event_name == 'push'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Generate a unique tag from git SHA (first 7 chars)
+      - name: Generate image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          BRANCH="${{ github.ref_name }}"
+          if [ "$BRANCH" = "main" ]; then
+            TAG="$SHORT_SHA"
+            EXTRA_TAG="latest"
+          else
+            TAG="${BRANCH}-${SHORT_SHA}"
+            EXTRA_TAG="staging"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "extra_tag=$EXTRA_TAG" >> $GITHUB_OUTPUT
+          echo "📦 Image tag: $TAG (also tagged: $EXTRA_TAG)"
+
+      # ── Build Backend ──
+      - name: Build & Push Backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.BACKEND_IMAGE }}:${{ steps.meta.outputs.extra_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Build Frontend ──
+      - name: Build & Push Frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.FRONTEND_IMAGE }}:${{ steps.meta.outputs.extra_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Build Worker ──
+      - name: Build & Push Worker
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.WORKER_IMAGE }}:${{ steps.meta.outputs.tag }}
+            ${{ env.WORKER_IMAGE }}:${{ steps.meta.outputs.extra_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 4: Update Infra Repo — triggers Argo CD GitOps sync
+  # ─────────────────────────────────────────────────────────────────────────
+  update-infra:
+    name: 🔄 Update Infra Repo
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: github.ref_name == 'main'
+
+    steps:
+      - name: Checkout infra repo
+        uses: actions/checkout@v4
+        with:
+          # REPLACE with your infra repo
+          repository: ${{ secrets.INFRA_REPO }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra-repo
+
+      - name: Update image tags in kustomization
+        working-directory: infra-repo
+        run: |
+          TAG="${{ needs.build-and-push.outputs.image-tag }}"
+          DOCKERHUB_USER="${{ secrets.DOCKERHUB_USERNAME }}"
+
+          # Use kustomize to set image tags
+          cd k8s/overlays/production
+
+          # Install kustomize
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          ./kustomize edit set image \
+            "${DOCKERHUB_USER}/ai-task-backend=${DOCKERHUB_USER}/ai-task-backend:${TAG}" \
+            "${DOCKERHUB_USER}/ai-task-frontend=${DOCKERHUB_USER}/ai-task-frontend:${TAG}" \
+            "${DOCKERHUB_USER}/ai-task-worker=${DOCKERHUB_USER}/ai-task-worker:${TAG}"
+
+          echo "✅ Updated image tags to: $TAG"
+
+      - name: Commit and push infra changes
+        working-directory: infra-repo
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git add .
+          git diff --staged --quiet || \
+            git commit -m "ci: update image tags to ${{ needs.build-and-push.outputs.image-tag }} [skip ci]"
+          git push
