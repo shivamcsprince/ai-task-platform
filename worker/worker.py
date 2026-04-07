@@ -1,11 +1,5 @@
 """
 TaskWorker — Core worker that pulls jobs from Redis and processes them.
-
-Design decisions:
-- Uses BRPOP (blocking right pop) for FIFO processing — efficient, no polling loop.
-- Multiple replicas can run safely: each job is atomically claimed by one worker.
-- On failure, task is marked 'failed' with error logged to MongoDB.
-- Retry logic built in at the job level (configurable MAX_RETRIES).
 """
 
 import os
@@ -31,15 +25,26 @@ class TaskWorker:
         self.max_retries = int(os.getenv("WORKER_MAX_RETRIES", "3"))
         self.running = True
 
-        # Connect to Redis
-        self.redis = redis.Redis(
-            host=os.getenv("REDIS_HOST", "localhost"),
-            port=int(os.getenv("REDIS_PORT", "6379")),
-            password=os.getenv("REDIS_PASSWORD") or None,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-        )
+        # Connect to Redis — supports Railway REDIS_URL or individual vars
+        redis_url = os.getenv("REDIS_URL")
+        if redis_url:
+            self.redis = redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+            )
+            logger.info("Connecting to Redis via REDIS_URL")
+        else:
+            self.redis = redis.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password=os.getenv("REDIS_PASSWORD") or None,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                retry_on_timeout=True,
+            )
+            logger.info("Connecting to Redis via host/port")
 
         # Connect to MongoDB
         mongo_uri = os.getenv("MONGODB_URI")
@@ -57,7 +62,7 @@ class TaskWorker:
         # Verify connections
         self.redis.ping()
         self.mongo.admin.command("ping")
-        logger.info("✅ Connected to Redis and MongoDB")
+        logger.info("Connected to Redis and MongoDB")
 
         # Graceful shutdown
         signal.signal(signal.SIGTERM, self._shutdown)
@@ -69,20 +74,18 @@ class TaskWorker:
 
     def start(self):
         """Main event loop — blocks on BRPOP until a job arrives."""
-        logger.info(f"👂 Listening on queue: '{self.queue_name}'")
+        logger.info(f"Listening on queue: '{self.queue_name}'")
 
         while self.running:
             try:
-                # BRPOP blocks for up to `poll_timeout` seconds, then returns None
                 result = self.redis.brpop(self.queue_name, timeout=self.poll_timeout)
 
                 if result is None:
-                    # Timeout — loop and check self.running again
                     continue
 
                 _, raw_job = result
                 job = json.loads(raw_job)
-                logger.info(f"📥 Received job: {job.get('jobId')} for task {job.get('taskId')}")
+                logger.info(f"Received job: {job.get('jobId')} for task {job.get('taskId')}")
 
                 self._handle_job(job)
 
@@ -109,11 +112,11 @@ class TaskWorker:
             attempt += 1
             try:
                 self._process_job(job, attempt)
-                return  # Success — exit retry loop
+                return
             except Exception as e:
                 logger.warning(f"Attempt {attempt}/{self.max_retries} failed for task {task_id}: {e}")
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)  # Exponential backoff: 2s, 4s
+                    time.sleep(2 ** attempt)
                 else:
                     logger.error(f"Task {task_id} failed after {self.max_retries} attempts")
                     self._mark_failed(task_id, str(e))
@@ -133,9 +136,11 @@ class TaskWorker:
                 "timestamp": datetime.now(timezone.utc),
             }
             logs.append(entry)
-            getattr(logger, level if level != "warn" else "warning")(f"[Task {task_id}] {message}")
+            getattr(logger, level if level != "warn" else "warning")(
+                f"[Task {task_id}] {message}"
+            )
 
-        # Mark as running
+        # Mark task as running in MongoDB
         self.tasks_col.update_one(
             {"_id": self._object_id(task_id)},
             {
@@ -156,12 +161,12 @@ class TaskWorker:
 
         log("info", f"Processing operation: '{operation}'")
 
-        # Perform the actual task
+        # Run the actual processing
         result = process_task(operation, input_text)
 
-        log("info", f"Operation completed successfully. Result length: {len(str(result))} chars")
+        log("info", f"Operation completed. Result length: {len(str(result))} chars")
 
-        # Mark as success
+        # Mark task as success in MongoDB
         self.tasks_col.update_one(
             {"_id": self._object_id(task_id)},
             {
@@ -174,7 +179,7 @@ class TaskWorker:
             },
         )
 
-        logger.info(f"✅ Task {task_id} completed successfully")
+        logger.info(f"Task {task_id} completed successfully")
 
     def _mark_failed(self, task_id: str, error_message: str):
         """Mark a task as permanently failed in MongoDB."""

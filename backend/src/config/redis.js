@@ -7,7 +7,11 @@ async function connectRedis() {
   const redisUrl = process.env.REDIS_URL;
 
   client = redisUrl
-    ? new Redis(redisUrl, { lazyConnect: true, maxRetriesPerRequest: 3 })
+    ? new Redis(redisUrl, {
+        lazyConnect: true,
+        maxRetriesPerRequest: 3,
+        tls: redisUrl.startsWith('rediss') ? {} : undefined,
+      })
     : new Redis({
         host: process.env.REDIS_HOST || 'localhost',
         port: parseInt(process.env.REDIS_PORT) || 6379,
