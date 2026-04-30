@@ -1,4 +1,3 @@
-
 # ⚡ AI Task Processing Platform
 
 A production-ready, full-stack asynchronous task processing platform built with the MERN stack, Python workers, Redis queues, Docker, Kubernetes, and GitOps via Argo CD.
